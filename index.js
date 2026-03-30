@@ -103,23 +103,24 @@ async function getStoredAppointments(today) {
   return map;
 }
 
-async function insertAppointment(appt) {
-  const { error } = await supabase.from('mirror_appointments').insert({
-    planity_id:       appt.planity_id,
-    client_name:      appt.client_name,
-    service:          appt.service,
-    start_time:       appt.start_time,
-    end_time:         appt.end_time,
-    barber_name:      appt.barber_name,
-    appointment_date: appt.appointment_date,
-  });
+async function upsertAppointment(appt) {
+  const { error } = await supabase
+    .from('mirror_appointments')
+    .upsert(
+      {
+        planity_id:       appt.planity_id,
+        client_name:      appt.client_name,
+        service:          appt.service,
+        start_time:       appt.start_time,
+        end_time:         appt.end_time,
+        barber_name:      appt.barber_name,
+        appointment_date: appt.appointment_date,
+      },
+      { onConflict: 'planity_id' }
+    );
 
   if (error) {
-    if (error.code === '23505') {
-      // Race condition — already inserted, ignore
-      return;
-    }
-    throw new Error(`[supabase] insertAppointment failed: ${error.message}`);
+    throw new Error(`[supabase] upsertAppointment failed: ${error.message}`);
   }
 }
 
@@ -177,26 +178,27 @@ async function runScrape() {
 
     let inserted = 0;
     let updated  = 0;
-    let deleted  = 0;
 
     // INSERT new / UPDATE changed
     for (const [planityId, appt] of scrapedMap) {
       const stored = storedMap.get(planityId);
 
       if (!stored) {
-        await insertAppointment(appt);
+        await upsertAppointment(appt);
         inserted++;
         console.log(
           `[scraper] INSERT → ${appt.barber_name} | ${appt.client_name} | ` +
           `${appt.service} | ${appt.start_time}`
         );
       } else {
-        // Check if anything meaningful changed
+        // Check if anything meaningful changed.
+        // Use getTime() for timestamps — Supabase returns "+00:00" suffix but
+        // luxon produces ".000Z"; string equality always fails, getTime() doesn't.
         const changed =
           stored.client_name !== appt.client_name ||
           stored.service     !== appt.service     ||
-          stored.start_time  !== appt.start_time  ||
-          stored.end_time    !== appt.end_time     ||
+          new Date(stored.start_time).getTime() !== new Date(appt.start_time).getTime() ||
+          new Date(stored.end_time).getTime()   !== new Date(appt.end_time).getTime()   ||
           stored.barber_name !== appt.barber_name;
 
         if (changed) {
@@ -211,6 +213,7 @@ async function runScrape() {
     }
 
     // DELETE appointments no longer on Planity (cancelled / removed)
+    let deleted = 0;
     for (const [planityId, stored] of storedMap) {
       if (!scrapedMap.has(planityId)) {
         await deleteAppointment(stored.id);
@@ -252,7 +255,6 @@ async function runScrape() {
   console.log('[scraper] Starting Planity scraper (live sync mode)...');
   console.log(`[scraper] Sync interval: ${INTERVAL_MS / 1000}s`);
 
-  // Run immediately on startup, then on interval
   await runScrape();
 
   setInterval(runScrape, INTERVAL_MS);

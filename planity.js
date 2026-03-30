@@ -5,15 +5,37 @@
  * Based on observed UI:
  *   - Login: email placeholder "Adresse email", password placeholder "Mot de passe", button "Se connecter"
  *   - Diary: 3 columns headed "Seventy", "Brayan", "Maely"
+ *   - Column headers have stable DOM IDs: header-calendar-0, header-calendar-1, header-calendar-2
  *   - Appointment text format: "HH:MM - HH:MM  ClientName  ServiceName"
  */
 
 const fs = require('fs');
+const { DateTime } = require('luxon');
 
 const PLANITY_URL = 'https://pro.planity.com';
 
-// Known barber column headers — must match exactly what Planity shows
+// Canonical barber names — must match exactly what the frontend expects.
+// Used to normalise column header text regardless of case or surrounding words
+// (e.g. "SEVENTY" → "Seventy", "BARCOLA (Maely)" → "Maely").
 const KNOWN_BARBERS = ['Seventy', 'Brayan', 'Maely'];
+
+// ── Timezone helper (Node.js / luxon — DST-aware) ─────────────────────────────
+
+/**
+ * Convert a Paris-local "HH:mm" string on a given date to a UTC ISO string.
+ * Uses luxon so DST transitions (e.g. March 30 = UTC+2, not UTC+1) are correct.
+ *
+ * @param {string} dateStr  YYYY-MM-DD (Europe/Paris date)
+ * @param {string} timeStr  HH:mm exactly as shown on Planity (e.g. "09:30")
+ * @returns {string}        ISO 8601 UTC string
+ */
+function parisTimeToUTC(dateStr, timeStr) {
+  return DateTime.fromFormat(
+    `${dateStr} ${timeStr}`,
+    'yyyy-MM-dd HH:mm',
+    { zone: 'Europe/Paris' }
+  ).toUTC().toISO();
+}
 
 // ── Login ─────────────────────────────────────────────────────────────────────
 
@@ -27,7 +49,7 @@ const KNOWN_BARBERS = ['Seventy', 'Brayan', 'Maely'];
 async function login(page, email, password) {
   console.log('[planity] Navigating to pro.planity.com...');
 
-  await page.goto(PLANITY_URL, { waitUntil: 'networkidle2', timeout: 40000 });
+  await page.goto(PLANITY_URL, { waitUntil: 'domcontentloaded', timeout: 40000 });
 
   // ── Step 1: Dismiss Didomi cookie popup BEFORE touching the form ────────────
   try {
@@ -54,12 +76,10 @@ async function login(page, email, password) {
     function fillInput(testId, value) {
       const el = document.querySelector(`[data-testid="${testId}"]`);
       if (!el) return false;
-      // Use native setter to bypass React's controlled-value guard
       const nativeSetter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype, 'value'
       ).set;
       nativeSetter.call(el, value);
-      // Dispatch input + change events so React updates its state
       el.dispatchEvent(new Event('input',  { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
@@ -72,23 +92,19 @@ async function login(page, email, password) {
   await page.screenshot({ path: 'debug_login_filled.png' });
 
   // ── Step 4: Submit — focus the Pressable div and press Enter ───────────────
-  // The submit is a <div tabindex="0" data-testid="sign-in-submit">.
-  // Pressing Enter on a focused tabindex="0" div triggers its click handler.
   await page.focus('[data-testid="sign-in-submit"]');
   await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {}),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
     page.keyboard.press('Enter'),
   ]);
   console.log('[planity] Submitted login form.');
 
-  // Give the SPA time to render the dashboard
   await new Promise((r) => setTimeout(r, 4000));
 
   const currentUrl = page.url();
   console.log('[planity] Post-login URL:', currentUrl);
   await page.screenshot({ path: 'debug_post_login.png', fullPage: true });
 
-  // If still showing the login form, login failed
   const stillOnLogin = await page.$('[data-testid="sign-in-submit"]').then(
     (el) => !!el, () => false
   );
@@ -103,7 +119,6 @@ async function login(page, email, password) {
 // ── Session check ─────────────────────────────────────────────────────────────
 
 async function isSessionExpired(page) {
-  // Only use URL — Planity SPA keeps the login form in the DOM even when logged in
   const url = page.url();
   return url.includes('/login') || url.includes('/sign-in');
 }
@@ -119,19 +134,17 @@ async function isSessionExpired(page) {
 async function getTodayAppointments(page) {
   console.log('[planity] Loading diary...');
 
-  // The diary is the default view after login. Navigate to root which redirects to diary.
   const currentUrl = page.url();
   if (!currentUrl.startsWith(PLANITY_URL) || await isSessionExpired(page)) {
     throw new Error('SESSION_EXPIRED');
   }
 
-  // If not already on the main app, navigate there
   if (!currentUrl.startsWith(PLANITY_URL)) {
-    await page.goto(PLANITY_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(PLANITY_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise((r) => setTimeout(r, 2000));
   }
 
-  // Click the "Diary" tab if it's visible (sometimes we land on another tab)
+  // Click the "Diary" tab if visible
   await page.evaluate(() => {
     const tabs = Array.from(document.querySelectorAll('a, button, [role="tab"]'));
     const diaryTab = tabs.find((t) => /diary|agenda|journal/i.test(t.textContent));
@@ -139,56 +152,71 @@ async function getTodayAppointments(page) {
   });
   await new Promise((r) => setTimeout(r, 1500));
 
-  // Re-check session
   if (await isSessionExpired(page)) {
     throw new Error('SESSION_EXPIRED');
   }
 
-  // Wait for appointment blocks to appear (up to 20s)
+  // Wait for BOTH column headers AND appointment time spans to be present.
+  // Previously only waited for a time span — if header-calendar-0 wasn't loaded
+  // yet, buildColumnBounds returned [] and every appointment got barberName='Unknown',
+  // producing a different planity_id hash each run → DELETE+INSERT every 30 s.
   await page.waitForFunction(
     () => {
-      const all = Array.from(document.querySelectorAll('*'));
-      return all.some((el) =>
+      const headersReady = document.getElementById('header-calendar-0') !== null;
+      const timesReady   = Array.from(document.querySelectorAll('*')).some((el) =>
         el.children.length === 0 &&
         /\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}/.test(el.textContent)
       );
+      return headersReady && timesReady;
     },
     { timeout: 20000 }
   ).catch(() => {
-    console.warn('[planity] Timed out waiting for time patterns — proceeding anyway.');
+    console.warn('[planity] Timed out waiting for diary to fully load — proceeding anyway.');
   });
 
-  // Debug snapshot — taken AFTER content loads
-  if (process.env.PLANITY_DEBUG === 'true') {
-    await page.screenshot({ path: 'debug_diary.png', fullPage: true });
-    fs.writeFileSync('debug_diary.html', await page.content());
-    console.log('[planity] Diary snapshot saved (debug_diary.png / debug_diary.html).');
-  }
+  // Extra settle time: React may still be rendering late appointments
+  await new Promise((r) => setTimeout(r, 1500));
 
-  // ── Extract all data from the page ──────────────────────────────────────────
-  const appointments = await page.evaluate((knownBarbers) => {
+  // Always save a debug snapshot so missing-appointment issues can be diagnosed
+  await page.screenshot({ path: 'debug_diary.png', fullPage: true });
+  fs.writeFileSync('debug_diary.html', await page.content());
+  console.log('[planity] Diary snapshot saved (debug_diary.png / debug_diary.html).');
+
+  // Today in Europe/Paris — computed in Node.js (luxon) so DST is handled correctly.
+  // Passed into page.evaluate as a parameter (page context has no access to luxon).
+  const todayStr = DateTime.now().setZone('Europe/Paris').toISODate();
+
+  // ── Extract raw appointment data from the page ────────────────────────────
+  //
+  // Key findings from the real Planity DOM (debug_diary.html):
+  //
+  //  1. Column headers have stable IDs: header-calendar-0, header-calendar-1, …
+  //     Their text content is the barber name ("Seventy", "Brayan", "Maely").
+  //
+  //  2. Each appointment div contains:
+  //       span.css-17xliyc  → "09:30 - 10:00 "  (time range)
+  //       span.css-8g9poh   → "Yohan Thomas "    (client name)
+  //       span.css-8g9poh   → " Coupe étudiant " (service)
+  //       span.css-8g9poh   → "Seventy choisi(e)"  (ONLINE bookings only)
+  //     Manual bookings have only 2 css-8g9poh spans (no barber span).
+  //
+  //  3. Because most appointments are manual (no choisi span), column position
+  //     is the only reliable barber signal. getBoundingClientRect() on the
+  //     appointment element returns its absolute screen X, which maps to a column.
+  //
+  // Time strings are returned as-is from the page; UTC conversion uses luxon
+  // outside evaluate so DST is handled correctly.
+
+  const rawAppointments = await page.evaluate((todayStr, knownBarbers) => {
     const results = [];
+    const TIME_RANGE_RE = /(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/;
 
-    // Today in Paris timezone (YYYY-MM-DD)
-    const now = new Date();
-    const month = now.getMonth() + 1;
-    const parisOffset = (month >= 4 && month <= 10) ? 2 : 1;
-    const parisNow = new Date(now.getTime() + parisOffset * 3600 * 1000);
-    const todayStr = parisNow.toISOString().slice(0, 10);
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    const TIME_RANGE_RE = /(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/;
-
-    function buildISO(dateStr, h, m) {
-      const mo = parseInt(dateStr.slice(5, 7), 10);
-      const off = (mo >= 4 && mo <= 10) ? 2 : 1;
-      const d = new Date(`${dateStr}T${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00Z`);
-      return new Date(d.getTime() - off * 3600 * 1000).toISOString();
-    }
-
-    function stableId(dateStr, sh, sm, clientName, barberName) {
-      const raw = `${dateStr}|${sh}:${sm}|${clientName}|${barberName}`;
+    // barberName is intentionally excluded from the hash.
+    // If column detection changes between runs (e.g. headers load late), the
+    // planity_id stays the same and we do an UPDATE instead of DELETE+INSERT,
+    // so the card refreshes in-place rather than disappearing from the mirror.
+    function stableId(dateStr, startTime, clientName) {
+      const raw = `${dateStr}|${startTime}|${clientName}`;
       let hash = 0;
       for (let i = 0; i < raw.length; i++) {
         hash = (hash << 5) - hash + raw.charCodeAt(i);
@@ -197,36 +225,70 @@ async function getTodayAppointments(page) {
       return `p_${Math.abs(hash).toString(16)}_${dateStr}`;
     }
 
-    // ── Column index detection (no getBoundingClientRect needed) ─────────────
-    // The calendar renders 3 column bodies as flex siblings of a time ruler.
-    // The time ruler has inline style width:52px.
-    // Walk up from an appointment element until we find a parent whose parent
-    // also contains the time ruler — that parent IS the column body.
-    // Return its 0-based index among the non-ruler siblings → maps to barber.
-    function getColumnIndex(el) {
-      let current = el;
-      for (let depth = 0; depth < 25; depth++) {
-        const parent = current.parentElement;
-        if (!parent) return -1;
-        const siblings = Array.from(parent.children);
-        // Check if any sibling (not current) is the time-ruler (width:52px)
-        const hasRuler = siblings.some(s =>
-          s !== current &&
-          s.style && s.style.width === '52px'
-        );
-        if (hasRuler) {
-          // parent is the flex grid; current is one column body
-          const columns = siblings.filter(s => !(s.style && s.style.width === '52px'));
-          return columns.indexOf(current);
-        }
-        current = parent;
+    // ── Column detection via header-calendar-N IDs ────────────────────────────
+    // Planity renders column headers with id="header-calendar-0", "…-1", "…-2".
+    // Each header is a <span> inside a positioned div that spans exactly one
+    // column. getBoundingClientRect on that div gives the true column boundaries.
+    //
+    // The header text may be all-caps ("SEVENTY") or contain extra words
+    // ("BARCOLA (Maely)"). We normalise against knownBarbers so the stored
+    // barber_name always matches the canonical casing the frontend expects.
+    function buildColumnBounds(knownBarbers) {
+      const columns = [];
+      for (let i = 0; i < 10; i++) {
+        const header = document.getElementById(`header-calendar-${i}`);
+        if (!header) break;
+        const raw = header.textContent.trim();
+        const lower = raw.toLowerCase();
+        // 1. Exact case-insensitive match ("SEVENTY" → "Seventy")
+        // 2. Substring match ("BARCOLA (Maely)" contains "maely" → "Maely")
+        const canonical =
+          knownBarbers.find((b) => b.toLowerCase() === lower) ||
+          knownBarbers.find((b) => lower.includes(b.toLowerCase())) ||
+          raw; // unknown barber — use raw text as fallback
+        // header.parentElement is the positioned div with the column's width/left
+        const rect = header.parentElement.getBoundingClientRect();
+        columns.push({
+          name:    canonical,
+          left:    rect.left,
+          right:   rect.right,
+          centerX: rect.left + rect.width / 2,
+        });
       }
-      return -1;
+      return columns;
     }
 
-    // ── 1. Find all time spans (class css-17xliyc) ────────────────────────────
-    // Each time span has sibling css-8g9poh spans: [clientName, service, optBarber]
-    const timeSpans = Array.from(document.querySelectorAll('span.css-17xliyc'));
+    function getBarberByPosition(el, columns) {
+      if (columns.length === 0) return 'Unknown';
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      // First try: appointment center falls within a column's bounds
+      for (const col of columns) {
+        if (cx >= col.left && cx <= col.right) return col.name;
+      }
+      // Fallback: nearest column centre (handles edge/overlap cases)
+      return columns.reduce((best, col) =>
+        Math.abs(cx - col.centerX) < Math.abs(cx - best.centerX) ? col : best
+      ).name;
+    }
+
+    const columns = buildColumnBounds(knownBarbers);
+    console.log('[planity/page] Columns detected:', JSON.stringify(columns.map(c => ({
+      name: c.name, left: Math.round(c.left), right: Math.round(c.right)
+    }))));
+
+    if (columns.length === 0) {
+      console.warn('[planity/page] No header-calendar-N elements found — barber detection will fail.');
+    }
+
+    // ── Scrape all appointment blocks ─────────────────────────────────────────
+    // Use text-based detection instead of a hardcoded CSS class — Planity uses
+    // different classes for different appointment types (e.g. css-17xliyc for
+    // online bookings, css-8ud9t2 for manual ones). Any leaf span whose text
+    // matches a time range is a valid time span.
+    const timeSpans = Array.from(document.querySelectorAll('span')).filter((el) =>
+      el.children.length === 0 && TIME_RANGE_RE.test(el.textContent.trim())
+    );
     const seen = new Set();
 
     for (const timeSpan of timeSpans) {
@@ -234,59 +296,72 @@ async function getTodayAppointments(page) {
       const match = timeText.match(TIME_RANGE_RE);
       if (!match) continue;
 
-      const [, sh, sm, eh, em] = match;
+      const [, startTime, endTime] = match; // e.g. "09:30", "10:00"
 
-      // Collect sibling css-8g9poh spans
       const parent = timeSpan.parentElement;
       if (!parent) continue;
 
       const contentSpans = Array.from(parent.querySelectorAll('span.css-8g9poh'))
-        .map(s => s.textContent.trim())
+        .map((s) => s.textContent.trim())
         .filter(Boolean);
 
-      if (contentSpans.length === 0) continue; // skip blocked-time slots
+      if (contentSpans.length === 0) continue;
 
-      const clientName = contentSpans[0];
-      if (!clientName || clientName === 'pause midi') continue; // skip lunch breaks
+      let clientName = contentSpans[0];
 
-      const service = contentSpans[1] || 'Unknown';
+      // Skip internal calendar blocks: lunch breaks, blocked slots
+      if (!clientName || /pause|midi/i.test(clientName)) continue;
 
-      // ── Barber detection ──────────────────────────────────────────────────
-      // 1. Check for "X choisi(e)" pattern in spans (online bookings)
-      let barberName = null;
-      const choisiSpan = contentSpans.find(s => s.includes('choisi'));
-      if (choisiSpan) {
-        barberName = knownBarbers.find(b => choisiSpan.startsWith(b)) || null;
+      const service = contentSpans[1] || '';
+
+      // "CLIENT" with no service = internal placeholder slot → skip
+      // "CLIENT" with a real service = walk-in where barber skipped the name → keep, display as "Walk-in"
+      if (clientName === 'CLIENT') {
+        if (!service) continue;
+        clientName = 'Walk-in';
       }
 
-      // 2. Fall back to column position (manual bookings)
-      if (!barberName) {
-        const colIdx = getColumnIndex(timeSpan);
-        barberName = knownBarbers[colIdx] || 'Unknown';
-      }
+      // Barber: use column position as primary source (reliable for all booking types).
+      // The header-calendar-N IDs give us exact column boundaries.
+      const barberName = getBarberByPosition(timeSpan, columns);
 
-      // ── Dedup by clientName + time ────────────────────────────────────────
-      const key = `${sh}:${sm}|${clientName}`;
+      // Dedup: same client at the same start time is the same appointment
+      const key = `${startTime}|${clientName}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
-      const planityId = stableId(todayStr, sh, sm, clientName, barberName);
-
       results.push({
-        planity_id:       planityId,
+        planity_id:       stableId(todayStr, startTime, clientName),
         client_name:      clientName,
-        service:          service.replace(/&amp;/g, '&'),
-        start_time:       buildISO(todayStr, parseInt(sh), parseInt(sm)),
-        end_time:         buildISO(todayStr, parseInt(eh), parseInt(em)),
+        service:          (service || 'Unknown').replace(/&amp;/g, '&'),
+        start_time_str:   startTime,   // Paris local — converted to UTC below
+        end_time_str:     endTime,
         barber_name:      barberName,
         appointment_date: todayStr,
       });
     }
 
     return results;
-  }, KNOWN_BARBERS);
+  }, todayStr, KNOWN_BARBERS);
+
+  // ── Convert Paris local times → UTC (DST-aware, via luxon) ────────────────
+  // Done here in Node.js because page.evaluate cannot use luxon.
+  // On March 30 Paris is UTC+2 (DST), so "09:30" → "07:30Z", not "08:30Z".
+  const appointments = rawAppointments.map((appt) => ({
+    planity_id:       appt.planity_id,
+    client_name:      appt.client_name,
+    service:          appt.service,
+    start_time:       parisTimeToUTC(appt.appointment_date, appt.start_time_str),
+    end_time:         parisTimeToUTC(appt.appointment_date, appt.end_time_str),
+    barber_name:      appt.barber_name,
+    appointment_date: appt.appointment_date,
+  }));
 
   console.log(`[planity] Scraped ${appointments.length} appointment(s) for today.`);
+  rawAppointments.forEach((a, i) => {
+    console.log(`[planity]   ${a.barber_name} | ${a.client_name} | ${a.start_time_str} Paris → ${appointments[i].start_time}`);
+  });
+
   return appointments;
 }
 
