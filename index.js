@@ -6,6 +6,7 @@
 
 require('dotenv').config();
 
+const http       = require('http');
 const puppeteer  = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 const { login, getTodayAppointments, isSessionExpired } = require('./planity');
@@ -250,6 +251,12 @@ async function runScrape() {
 }
 
 // ── Startup ───────────────────────────────────────────────────────────────────
+
+// ── Keep-alive HTTP server (required by Railway to keep the service running) ──
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('OK');
+}).listen(process.env.PORT || 3001);
 
 (async () => {
   console.log('[scraper] Starting Planity scraper (live sync mode)...');
