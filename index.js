@@ -379,8 +379,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(process.env.PORT || 3001, () => {
-  console.log(`[scraper] HTTP server listening on port ${process.env.PORT || 3001}`);
+server.listen(8080, () => {
+  console.log('[scraper] HTTP server listening on port 8080');
 });
 
 // ── Startup ───────────────────────────────────────────────────────────────────
