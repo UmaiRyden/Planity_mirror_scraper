@@ -152,6 +152,25 @@ async function getTodayAppointments(page) {
   });
   await new Promise((r) => setTimeout(r, 1500));
 
+  // Navigate to TODAY in the diary — Planity may still be showing a previous date
+  // if the barber was browsing another day, or if the scraper restarted mid-week.
+  // Try clicking the "Aujourd'hui" / "Today" button to reset the calendar view.
+  const clickedToday = await page.evaluate(() => {
+    // Planity renders the "Aujourd'hui" button as a plain div, not a <button>
+    const all = Array.from(document.querySelectorAll('div, button, a, [role="button"]'));
+    const todayBtn = all.find((el) =>
+      el.textContent.trim() === "Aujourd'hui"
+    );
+    if (todayBtn) { todayBtn.click(); return true; }
+    return false;
+  });
+  if (clickedToday) {
+    console.log('[planity] Clicked "today" button to reset diary to current date.');
+    await new Promise((r) => setTimeout(r, 1000));
+  } else {
+    console.warn('[planity] "Today" button not found — diary may be showing a different date.');
+  }
+
   if (await isSessionExpired(page)) {
     throw new Error('SESSION_EXPIRED');
   }
@@ -321,6 +340,8 @@ async function getTodayAppointments(page) {
         clientName = 'Walk-in';
       }
 
+      // Price is not shown on diary cards — scraped separately by clicking each appointment
+
       // Barber: use column position as primary source (reliable for all booking types).
       // The header-calendar-N IDs give us exact column boundaries.
       const barberName = getBarberByPosition(timeSpan, columns);
@@ -351,6 +372,8 @@ async function getTodayAppointments(page) {
     planity_id:       appt.planity_id,
     client_name:      appt.client_name,
     service:          appt.service,
+    price:            null,            // filled in by scrapeAppointmentPrice after diary scrape
+    start_time_local: appt.start_time_str, // Paris HH:mm — used for price scraping clicks
     start_time:       parisTimeToUTC(appt.appointment_date, appt.start_time_str),
     end_time:         parisTimeToUTC(appt.appointment_date, appt.end_time_str),
     barber_name:      appt.barber_name,
@@ -365,4 +388,314 @@ async function getTodayAppointments(page) {
   return appointments;
 }
 
-module.exports = { login, getTodayAppointments, isSessionExpired };
+// ── Price scraping (requires clicking each appointment to open its modal) ─────
+
+/**
+ * Click an appointment, read the price from the modal, then close it.
+ * The price field ("18,00" + "€") appears in the service row of the modal.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {string} startTimeStr  Paris local HH:mm
+ * @param {string} clientName    As scraped from diary
+ * @returns {Promise<string|null>}  e.g. "18,00€" or null
+ */
+async function scrapeAppointmentPrice(page, startTimeStr, clientName, barberName) {
+  try {
+    await ensureDiary(page);
+
+    const found = await clickAppointmentCard(page, startTimeStr, clientName, barberName);
+    if (!found) {
+      console.warn(`[planity] scrapeAppointmentPrice: card not found (${startTimeStr} / ${clientName})`);
+      return null;
+    }
+
+    // Wait for modal to open — same signal as markNotAttended (proven to work)
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('*')).some(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Pas venu'
+      ),
+      { timeout: 6000 }
+    ).catch(() => {});
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    const price = await page.evaluate(() => {
+      // Scope ALL searches to the modal — not the diary behind it.
+      // The modal is the smallest element that contains both "Rendez-vous" (title)
+      // and "Pas venu" (bottom action link).
+      const modalCandidates = Array.from(document.querySelectorAll('*')).filter(
+        (el) => el.textContent.includes('Rendez-vous') && el.textContent.includes('Pas venu')
+      );
+      // Pick the candidate with the least text (most specific / deepest container)
+      const modal = modalCandidates.reduce((best, el) => {
+        if (!best) return el;
+        return el.textContent.length < best.textContent.length ? el : best;
+      }, null);
+
+      if (!modal) return null;
+
+      // Strategy 1: find "€" leaf inside modal, read previous sibling (the price input/text)
+      const euroLeaves = Array.from(modal.querySelectorAll('*')).filter(
+        (el) => el.children.length === 0 && el.textContent.trim() === '€'
+      );
+      for (const euroEl of euroLeaves) {
+        // Direct previous sibling
+        const prev = euroEl.previousElementSibling;
+        if (prev) {
+          const val = (prev.tagName === 'INPUT' ? prev.value : prev.textContent || '').trim();
+          if (/^\d+([,.]\d+)?$/.test(val)) {
+            const num = parseFloat(val.replace(',', '.'));
+            if (num > 0 && num < 10000) return val + '€';
+          }
+        }
+        // One level up — parent's previous sibling may contain the input
+        const parentPrev = euroEl.parentElement?.previousElementSibling;
+        if (parentPrev) {
+          const inp = parentPrev.querySelector('input');
+          const val = (inp?.value || parentPrev.textContent || '').trim();
+          if (/^\d+([,.]\d+)?$/.test(val)) {
+            const num = parseFloat(val.replace(',', '.'));
+            if (num > 0 && num < 10000) return val + '€';
+          }
+        }
+      }
+
+      // Strategy 2: fallback — any input inside modal with comma-decimal value.
+      // French price format always uses comma: "18,00", "16,00".
+      // Duration is a plain integer ("30", "45") — /^\d+,\d+$/ won't match it.
+      for (const inp of modal.querySelectorAll('input')) {
+        const val = inp.value?.trim();
+        if (val && /^\d+,\d+$/.test(val)) {
+          const num = parseFloat(val.replace(',', '.'));
+          if (num > 0 && num < 10000) return val + '€';
+        }
+      }
+
+      return null;
+    });
+
+    // Close modal
+    await page.keyboard.press('Escape');
+    await new Promise((r) => setTimeout(r, 800));
+
+    return price;
+  } catch (err) {
+    console.error(`[planity] scrapeAppointmentPrice failed (${startTimeStr} / ${clientName}): ${err.message}`);
+    try { await page.keyboard.press('Escape'); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 500));
+    return null;
+  }
+}
+
+// ── Puppeteer write-back helpers ──────────────────────────────────────────────
+// These functions reuse the existing logged-in browser page.
+// All Planity-side actions are wrapped in try/catch — if the UI action fails,
+// we log the error but let the caller still update the local DB.
+
+/**
+ * Ensure the page is showing today's diary view.
+ */
+async function ensureDiary(page) {
+  const url = page.url();
+  if (!url.startsWith(PLANITY_URL)) {
+    await page.goto(PLANITY_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  await page.evaluate(() => {
+    const tabs = Array.from(document.querySelectorAll('a, button, [role="tab"]'));
+    const diaryTab = tabs.find((t) => /diary|agenda|journal/i.test(t.textContent));
+    if (diaryTab) diaryTab.click();
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+}
+
+/**
+ * Click an appointment card in the diary by its Paris start time and client name.
+ * Walk-in appointments are stored as "Walk-in" but appear as "CLIENT" on Planity.
+ */
+async function clickAppointmentCard(page, startTimeStr, clientName, barberName) {
+  const planityClientName = clientName === 'Walk-in' ? 'CLIENT' : clientName;
+  const found = await page.evaluate((time, client, barber) => {
+    // Match only spans whose text STARTS with the time — avoids matching "10:00 - 10:30"
+    // when we're looking for the appointment that starts at "10:30"
+    const timeSpans = Array.from(document.querySelectorAll('span')).filter(
+      (el) => el.children.length === 0 && el.textContent.trim().startsWith(time)
+    );
+
+    // Strategy 1: full client name match
+    for (const sp of timeSpans) {
+      const card = sp.parentElement;
+      if (card && card.textContent.includes(client)) {
+        card.click();
+        return { found: true };
+      }
+    }
+
+    // Strategy 2: partial name match — first word only (handles truncated diary names)
+    const firstWord = client.split(' ')[0];
+    if (firstWord && firstWord.length >= 3) {
+      for (const sp of timeSpans) {
+        const card = sp.parentElement;
+        if (card && card.textContent.includes(firstWord)) {
+          card.click();
+          return { found: true, partial: true };
+        }
+      }
+    }
+
+    // Strategy 3: barber column X-position (disambiguates same-time slots across barbers)
+    if (barber && timeSpans.length > 1) {
+      const barberLeafs = Array.from(document.querySelectorAll('*')).filter(
+        (el) => el.children.length === 0 && el.textContent.trim() === barber
+      );
+      if (barberLeafs.length > 0) {
+        const headerCenterX = barberLeafs[0].getBoundingClientRect().left +
+                              barberLeafs[0].getBoundingClientRect().width / 2;
+        let bestSp = null, bestDist = Infinity;
+        for (const sp of timeSpans) {
+          const r = sp.getBoundingClientRect();
+          const dist = Math.abs((r.left + r.width / 2) - headerCenterX);
+          if (dist < bestDist) { bestDist = dist; bestSp = sp; }
+        }
+        if (bestSp && bestDist < 300) {
+          bestSp.parentElement?.click();
+          return { found: true, byBarber: true };
+        }
+      }
+    }
+
+    // Fallback: time only — first span in DOM order
+    if (timeSpans.length > 0) {
+      timeSpans[0].parentElement.click();
+      return { found: true, fallback: true };
+    }
+    return { found: false };
+  }, startTimeStr, planityClientName, barberName);
+
+  if (found.partial)   console.warn(`[planity] clickAppointmentCard: partial name match for ${startTimeStr} / ${clientName}`);
+  if (found.byBarber)  console.log(`[planity] clickAppointmentCard: barber-column match for ${startTimeStr} / ${clientName}`);
+  if (found.fallback)  console.warn(`[planity] clickAppointmentCard: time-only fallback for ${startTimeStr} / ${clientName}`);
+  return found.found;
+}
+
+/**
+ * Mark an appointment as "client non présenté" (no-show) on Planity.
+ * Tries to find the no-show button in the appointment modal.
+ * Logs a warning but does NOT throw if the Planity action fails.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {string} startTimeStr  Paris local HH:mm, e.g. "09:30"
+ * @param {string} clientName    As stored in DB (may be "Walk-in")
+ */
+async function markNotAttended(page, startTimeStr, clientName, barberName) {
+  try {
+    await ensureDiary(page);
+    const found = await clickAppointmentCard(page, startTimeStr, clientName, barberName);
+    if (!found) {
+      console.warn(`[planity] markNotAttended: appointment not found on diary (${startTimeStr} / ${clientName})`);
+      return;
+    }
+    // Wait for the appointment modal to open (title "Rendez-vous" appears)
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('*')).some(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Pas venu'
+      ),
+      { timeout: 6000 }
+    ).catch(() => {});
+
+    await new Promise((r) => setTimeout(r, 500));
+
+    // "Pas venu" is a text link at the bottom of the modal — not a <button>
+    const clicked = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('*'));
+      const btn = all.find(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Pas venu'
+      );
+      if (btn) { btn.click(); return true; }
+      return false;
+    });
+
+    if (clicked) {
+      await new Promise((r) => setTimeout(r, 1000));
+      console.log(`[planity] Marked as "Pas venu" on Planity: ${startTimeStr} / ${clientName}`);
+    } else {
+      console.warn('[planity] markNotAttended: "Pas venu" element not found in modal — DB updated only');
+    }
+  } catch (err) {
+    console.error(`[planity] markNotAttended Planity action failed: ${err.message}`);
+  }
+}
+
+/**
+ * Delete an appointment on Planity (used for Supprimer and Encaisser actions).
+ * Logs a warning but does NOT throw if the Planity action fails.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {string} startTimeStr  Paris local HH:mm
+ * @param {string} clientName    As stored in DB
+ */
+async function deleteOnPlanity(page, startTimeStr, clientName, barberName) {
+  try {
+    await ensureDiary(page);
+    const found = await clickAppointmentCard(page, startTimeStr, clientName, barberName);
+    if (!found) {
+      console.warn(`[planity] deleteOnPlanity: appointment not found on diary (${startTimeStr} / ${clientName})`);
+      return;
+    }
+
+    // Wait for modal to open (same signal used everywhere)
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('*')).some(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Pas venu'
+      ),
+      { timeout: 6000 }
+    ).catch(() => {});
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    // "Supprimer" is a plain text leaf in the modal footer — same pattern as "Pas venu"
+    const clicked = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('*'));
+      const btn = all.find(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Supprimer'
+      );
+      if (btn) { btn.click(); return true; }
+      return false;
+    });
+
+    if (!clicked) {
+      console.warn('[planity] deleteOnPlanity: "Supprimer" not found in modal — DB updated only');
+      return;
+    }
+
+    // "Confirmer la suppression" appears immediately after clicking Supprimer
+    await new Promise((r) => setTimeout(r, 600));
+
+    const confirmed = await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll('*'));
+      const confirmBtn = all.find(
+        (el) => el.children.length === 0 && el.textContent.trim() === 'Confirmer la suppression'
+      );
+      if (confirmBtn) { confirmBtn.click(); return true; }
+      return false;
+    });
+
+    if (confirmed) {
+      await new Promise((r) => setTimeout(r, 800));
+      console.log(`[planity] Deleted on Planity: ${startTimeStr} / ${clientName}`);
+    } else {
+      console.warn(`[planity] deleteOnPlanity: "Confirmer la suppression" not found — DB deleted only`);
+    }
+  } catch (err) {
+    console.error(`[planity] deleteOnPlanity action failed: ${err.message}`);
+  }
+}
+
+module.exports = {
+  login,
+  getTodayAppointments,
+  isSessionExpired,
+  markNotAttended,
+  deleteOnPlanity,
+  scrapeAppointmentPrice,
+};

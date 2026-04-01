@@ -1,15 +1,35 @@
 /**
  * index.js — Planity scraper entry point
- * Runs every 30 seconds via setInterval, full live sync with Planity Pro.
- * Inserts new appointments, updates changed ones, deletes removed ones.
+ *
+ * Sync logic (append-only):
+ *   - INSERT new appointments found on Planity
+ *   - UPDATE changed appointments (time, service, barber, price)
+ *   - Never DELETE during sync — cancellations are handled by barbers via the panel
+ *   - At the start of each new Paris day, clean up rows from previous days
+ *
+ * HTTP server on PORT (Railway) / 3001 (local):
+ *   - GET  /              → health check "OK"
+ *   - POST /actions/not-attended  → Puppeteer: mark no-show on Planity + update DB
+ *   - POST /actions/delete        → Puppeteer: delete on Planity + set hidden=true in DB
+ *   - POST /actions/encaisser     → Puppeteer: delete on Planity + set status=paid in DB
+ *
+ * Action requests must carry: Authorization: Bearer <SCRAPER_SECRET>
  */
 
 require('dotenv').config();
 
 const http       = require('http');
 const puppeteer  = require('puppeteer');
+const { DateTime } = require('luxon');
 const { createClient } = require('@supabase/supabase-js');
-const { login, getTodayAppointments, isSessionExpired } = require('./planity');
+const {
+  login,
+  getTodayAppointments,
+  isSessionExpired,
+  markNotAttended,
+  deleteOnPlanity,
+  scrapeAppointmentPrice,
+} = require('./planity');
 
 // ── Environment ──────────────────────────────────────────────────────────────
 const {
@@ -17,6 +37,7 @@ const {
   PLANITY_PASSWORD,
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
+  SCRAPER_SECRET,
 } = process.env;
 
 if (!PLANITY_EMAIL || !PLANITY_PASSWORD) {
@@ -37,7 +58,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 let browser    = null;
 let page       = null;
 let isLoggedIn = false;
-let isRunning  = false; // guard against overlapping runs
+let isRunning  = false;   // guard: scrape cycle in progress
+let actionLock = false;   // guard: Puppeteer write-back action in progress
 
 // ── Browser / page lifecycle ──────────────────────────────────────────────────
 
@@ -75,22 +97,47 @@ async function ensureLoggedIn() {
   }
 }
 
-// ── Today's date in Paris timezone (YYYY-MM-DD) ───────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function getTodayParis() {
-  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Paris' }).format(new Date());
+  return DateTime.now().setZone('Europe/Paris').toISODate(); // YYYY-MM-DD, always Paris date
+}
+
+/**
+ * Convert a UTC ISO string to Paris local HH:mm (for Puppeteer lookups).
+ */
+function utcToParisHHmm(isoString) {
+  return new Intl.DateTimeFormat('en-GB', {
+    hour:     '2-digit',
+    minute:   '2-digit',
+    timeZone: 'Europe/Paris',
+    hour12:   false,
+  }).format(new Date(isoString));
+}
+
+/**
+ * Delete all mirror_appointments rows that are NOT from today (Paris).
+ * Runs at the start of every scrape cycle — safe to call repeatedly.
+ */
+async function cleanupOldAppointments(todayParis) {
+  const { error } = await supabase
+    .from('mirror_appointments')
+    .delete()
+    .neq('appointment_date', todayParis);
+
+  if (error) {
+    console.error('[scraper] Cleanup failed:', error.message);
+  } else {
+    console.log(`[scraper] Cleaned up old appointments. Today is ${todayParis}`);
+  }
 }
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 
-/**
- * Fetch all rows for today from mirror_appointments.
- * Returns a Map keyed by planity_id.
- */
 async function getStoredAppointments(today) {
   const { data, error } = await supabase
     .from('mirror_appointments')
-    .select('id, planity_id, client_name, service, start_time, end_time, barber_name')
+    .select('id, planity_id, client_name, service, price, start_time, end_time, barber_name')
     .eq('appointment_date', today);
 
   if (error) {
@@ -112,6 +159,7 @@ async function upsertAppointment(appt) {
         planity_id:       appt.planity_id,
         client_name:      appt.client_name,
         service:          appt.service,
+        price:            appt.price,
         start_time:       appt.start_time,
         end_time:         appt.end_time,
         barber_name:      appt.barber_name,
@@ -125,16 +173,21 @@ async function upsertAppointment(appt) {
   }
 }
 
-async function updateAppointment(id, appt) {
+async function updateAppointment(id, appt, resetPrice = false) {
+  // price is managed separately by scrapeAppointmentPrice — never overwrite with null
+  // unless the service itself changed (resetPrice=true), which forces a re-scrape
+  const data = {
+    client_name: appt.client_name,
+    service:     appt.service,
+    start_time:  appt.start_time,
+    end_time:    appt.end_time,
+    barber_name: appt.barber_name,
+  };
+  if (resetPrice) data.price = null;
+
   const { error } = await supabase
     .from('mirror_appointments')
-    .update({
-      client_name:  appt.client_name,
-      service:      appt.service,
-      start_time:   appt.start_time,
-      end_time:     appt.end_time,
-      barber_name:  appt.barber_name,
-    })
+    .update(data)
     .eq('id', id);
 
   if (error) {
@@ -142,22 +195,11 @@ async function updateAppointment(id, appt) {
   }
 }
 
-async function deleteAppointment(id) {
-  const { error } = await supabase
-    .from('mirror_appointments')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    throw new Error(`[supabase] deleteAppointment failed: ${error.message}`);
-  }
-}
-
-// ── Main scrape cycle ─────────────────────────────────────────────────────────
+// ── Main scrape cycle (append-only) ──────────────────────────────────────────
 
 async function runScrape() {
-  if (isRunning) {
-    console.log('[scraper] Previous scrape still running — skipping tick.');
+  if (isRunning || actionLock) {
+    console.log('[scraper] Busy (scrape or action in progress) — skipping tick.');
     return;
   }
 
@@ -165,13 +207,14 @@ async function runScrape() {
   console.log(`\n[scraper] ── Scrape cycle at ${new Date().toISOString()} ──`);
 
   try {
+    const today = getTodayParis();
+    await cleanupOldAppointments(today);
+
     await ensureLoggedIn();
 
-    const today        = getTodayParis();
-    const scraped      = await getTodayAppointments(page);
-    const storedMap    = await getStoredAppointments(today);
+    const scraped   = await getTodayAppointments(page);
+    const storedMap = await getStoredAppointments(today);
 
-    // Build a set of planity_ids currently on Planity
     const scrapedMap = new Map();
     for (const appt of scraped) {
       scrapedMap.set(appt.planity_id, appt);
@@ -180,7 +223,6 @@ async function runScrape() {
     let inserted = 0;
     let updated  = 0;
 
-    // INSERT new / UPDATE changed
     for (const [planityId, appt] of scrapedMap) {
       const stored = storedMap.get(planityId);
 
@@ -192,18 +234,18 @@ async function runScrape() {
           `${appt.service} | ${appt.start_time}`
         );
       } else {
-        // Check if anything meaningful changed.
-        // Use getTime() for timestamps — Supabase returns "+00:00" suffix but
-        // luxon produces ".000Z"; string equality always fails, getTime() doesn't.
+        // Compare meaningful fields; use getTime() for timestamps (format differs)
+        const serviceChanged = stored.service !== appt.service;
         const changed =
           stored.client_name !== appt.client_name ||
-          stored.service     !== appt.service     ||
+          serviceChanged     ||
           new Date(stored.start_time).getTime() !== new Date(appt.start_time).getTime() ||
           new Date(stored.end_time).getTime()   !== new Date(appt.end_time).getTime()   ||
           stored.barber_name !== appt.barber_name;
 
         if (changed) {
-          await updateAppointment(stored.id, appt);
+          // resetPrice=true only when service changed — forces price re-scrape
+          await updateAppointment(stored.id, appt, serviceChanged);
           updated++;
           console.log(
             `[scraper] UPDATE → ${appt.barber_name} | ${appt.client_name} | ` +
@@ -213,21 +255,38 @@ async function runScrape() {
       }
     }
 
-    // DELETE appointments no longer on Planity (cancelled / removed)
-    let deleted = 0;
-    for (const [planityId, stored] of storedMap) {
-      if (!scrapedMap.has(planityId)) {
-        await deleteAppointment(stored.id);
-        deleted++;
-        console.log(
-          `[scraper] DELETE → planity_id=${planityId} (no longer on Planity)`
-        );
+    // NOTE: No delete loop — scraper is append-only.
+    // Barbers remove appointments via the panel (Supprimer / Encaisser buttons).
+
+    // ── Scrape prices for appointments that don't have one yet ────────────────
+    const needsPrices = scraped.filter((appt) => {
+      const stored = storedMap.get(appt.planity_id);
+      // New appointment (stored is undefined) OR existing row with no price
+      return !stored || !stored.price;
+    });
+
+    console.log(`[scraper] Price queue: ${needsPrices.length} appointment(s) need price scraping.`);
+    if (needsPrices.length > 0) {
+      console.log(`[scraper] Scraping prices for ${needsPrices.length} appointment(s)...`);
+      for (const appt of needsPrices) {
+        const price = await scrapeAppointmentPrice(page, appt.start_time_local, appt.client_name, appt.barber_name);
+        if (price) {
+          const { error: priceErr } = await supabase
+            .from('mirror_appointments')
+            .update({ price })
+            .eq('planity_id', appt.planity_id);
+          if (priceErr) {
+            console.error(`[scraper] Price update failed for ${appt.client_name}:`, priceErr.message);
+          } else {
+            console.log(`[scraper] Price: ${appt.client_name} (${appt.start_time_local}) → ${price}`);
+          }
+        } else {
+          console.log(`[scraper] No price found for ${appt.client_name} (${appt.start_time_local})`);
+        }
       }
     }
 
-    console.log(
-      `[scraper] Done. inserted=${inserted}, updated=${updated}, deleted=${deleted}`
-    );
+    console.log(`[scraper] Done. inserted=${inserted}, updated=${updated}`);
 
   } catch (err) {
     if (err.message === 'SESSION_EXPIRED') {
@@ -250,13 +309,81 @@ async function runScrape() {
   }
 }
 
-// ── Startup ───────────────────────────────────────────────────────────────────
+// ── HTTP server — health check + Puppeteer action endpoints ──────────────────
 
-// ── Keep-alive HTTP server (required by Railway to keep the service running) ──
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('OK');
-}).listen(process.env.PORT || 3001);
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); } catch { resolve({}); }
+    });
+  });
+}
+
+function jsonResponse(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+const server = http.createServer(async (req, res) => {
+  // Health check
+  if (req.method === 'GET') {
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+
+  // All POST routes require the shared secret
+  const auth = req.headers['authorization'];
+  const expectedAuth = SCRAPER_SECRET ? `Bearer ${SCRAPER_SECRET}` : null;
+  if (expectedAuth && auth !== expectedAuth) {
+    jsonResponse(res, 401, { error: 'Unauthorized' });
+    return;
+  }
+
+  // Block if scrape or another action is running
+  if (isRunning || actionLock) {
+    jsonResponse(res, 503, { error: 'Scraper busy — try again shortly' });
+    return;
+  }
+
+  const body = await parseBody(req);
+  const { start_time_local, client_name, barber_name } = body;
+
+  if (!start_time_local || !client_name) {
+    jsonResponse(res, 400, { error: 'start_time_local and client_name are required' });
+    return;
+  }
+
+  actionLock = true;
+  try {
+    await ensureLoggedIn();
+
+    if (req.url === '/actions/not-attended') {
+      await markNotAttended(page, start_time_local, client_name, barber_name);
+      jsonResponse(res, 200, { ok: true });
+
+    } else if (req.url === '/actions/delete' || req.url === '/actions/encaisser') {
+      await deleteOnPlanity(page, start_time_local, client_name, barber_name);
+      jsonResponse(res, 200, { ok: true });
+
+    } else {
+      jsonResponse(res, 404, { error: 'Unknown action' });
+    }
+  } catch (err) {
+    console.error('[scraper] Action handler error:', err.message);
+    jsonResponse(res, 500, { error: err.message });
+  } finally {
+    actionLock = false;
+  }
+});
+
+server.listen(process.env.PORT || 3001, () => {
+  console.log(`[scraper] HTTP server listening on port ${process.env.PORT || 3001}`);
+});
+
+// ── Startup ───────────────────────────────────────────────────────────────────
 
 (async () => {
   console.log('[scraper] Starting Planity scraper (live sync mode)...');
